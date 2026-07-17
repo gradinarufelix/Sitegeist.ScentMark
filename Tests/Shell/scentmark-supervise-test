@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SUPERVISOR="$PACKAGE_ROOT/Resources/Private/Scripts/scentmark-supervise"
+FAKE_FLOW="$PACKAGE_ROOT/Tests/Shell/Fixtures/fake-flow"
+WORKER="$PACKAGE_ROOT/Tests/Shell/Fixtures/worker"
+TEST_ROOT="$(mktemp -d)"
+SUPERVISOR_PID=''
+
+cleanup() {
+  if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+    kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
+    wait "$SUPERVISOR_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TEST_ROOT"
+}
+
+trap cleanup EXIT
+
+wait_for_pattern() {
+  file="$1"
+  pattern="$2"
+  attempts=0
+  until [ -f "$file" ] && grep -q "$pattern" "$file"; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 100 ]; then
+      echo "Timed out waiting for '$pattern' in $file." >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+wait_for_count() {
+  file="$1"
+  pattern="$2"
+  expected_count="$3"
+  attempts=0
+  until [ -f "$file" ] && [ "$(grep -c "$pattern" "$file")" -ge "$expected_count" ]; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 100 ]; then
+      echo "Timed out waiting for $expected_count occurrences of '$pattern' in $file." >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+run_supervisor() {
+  state_directory="$1"
+  successful_barks="$2"
+  shift 2
+
+  mkdir -p "$state_directory"
+  SCENTMARK_FAKE_FLOW_STATE_DIRECTORY="$state_directory" \
+  SCENTMARK_FAKE_FLOW_SUCCESSFUL_BARKS="$successful_barks" \
+  SCENTMARK_FLOW_COMMAND="$FAKE_FLOW" \
+    "$SUPERVISOR" \
+      pack \
+      replica-a \
+      --lease-seconds 15 \
+      --heartbeat-seconds 1 \
+      --retry-seconds 1 \
+      --max-missed-heartbeats 1 \
+      --flow-timeout-seconds 1 \
+      --shutdown-grace-seconds 1 \
+      "$@" \
+      -- \
+      "$WORKER" \
+      > "$state_directory/supervisor.log" 2>&1 &
+  SUPERVISOR_PID="$!"
+}
+
+failure_state="$TEST_ROOT/heartbeat-failure"
+run_supervisor "$failure_state" 1
+wait_for_pattern "$failure_state/worker.log" stopped
+if [ "$(grep -c '^started$' "$failure_state/worker.log")" -ne 1 ]; then
+  echo 'The supervisor started more than one child before losing its lease.' >&2
+  exit 1
+fi
+kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
+wait "$SUPERVISOR_PID" 2>/dev/null || true
+SUPERVISOR_PID=''
+
+restart_state="$TEST_ROOT/child-restart"
+SCENTMARK_FAKE_WORKER_EXIT=1 run_supervisor \
+  "$restart_state" \
+  999 \
+  --heartbeat-seconds 5
+wait_for_count "$restart_state/worker.log" '^started$' 2
+if [ "$(<"$restart_state/bark-count")" -ne 1 ]; then
+  echo 'A quick child restart triggered an unnecessary lease heartbeat.' >&2
+  exit 1
+fi
+kill -TERM "$SUPERVISOR_PID"
+wait "$SUPERVISOR_PID" 2>/dev/null || true
+SUPERVISOR_PID=''
+
+shared_state="$TEST_ROOT/shared-shutdown"
+run_supervisor "$shared_state" 999
+wait_for_pattern "$shared_state/worker.log" started
+kill -TERM "$SUPERVISOR_PID"
+wait "$SUPERVISOR_PID" 2>/dev/null || true
+SUPERVISOR_PID=''
+if grep -q '^scentmark:release$' "$shared_state/flow.log"; then
+  echo 'A shared lease was unexpectedly released.' >&2
+  exit 1
+fi
+
+exclusive_state="$TEST_ROOT/exclusive-shutdown"
+run_supervisor "$exclusive_state" 999 --release-on-exit
+wait_for_pattern "$exclusive_state/worker.log" started
+kill -TERM "$SUPERVISOR_PID"
+wait "$SUPERVISOR_PID" 2>/dev/null || true
+SUPERVISOR_PID=''
+if ! grep -q '^scentmark:release$' "$exclusive_state/flow.log"; then
+  echo 'The exclusive lease was not released.' >&2
+  exit 1
+fi
+
+echo 'scentmark-supervise tests passed.'

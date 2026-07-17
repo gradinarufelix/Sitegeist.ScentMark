@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace Sitegeist\ScentMark\Domain\Model;
@@ -19,20 +20,19 @@ use Doctrine\ORM\Mapping as ORM;
  */
 class Pack
 {
-
     /**
      * @var string
      */
     protected $packScent;
 
     /**
-     * @var string
+     * @var string|null
      * @ORM\Column(nullable=true)
      */
     protected $leaderScent;
 
     /**
-     * @var \DateTimeImmutable
+     * @var \DateTimeImmutable|null
      * @ORM\Column(nullable=true)
      */
     protected $leadExpiration;
@@ -88,24 +88,42 @@ class Pack
         $this->leadExpiration = $leadExpiration;
     }
 
-    public function getCurrentlyActiveLeaderScent(): ?string
+    public function getCurrentlyActiveLeaderScent(?\DateTimeImmutable $now = null): ?string
     {
+        $now = $now ?? new \DateTimeImmutable();
         if (
             $this->leaderScent !== null
             && $this->leadExpiration instanceof \DateTimeImmutable
-            && $this->leadExpiration->getTimestamp() > time()
+            && $this->leadExpiration > $now
         ) {
             return $this->leaderScent;
         }
         return null;
     }
 
-    public function setCurrentlyActiveLeaderScent(string $leaderScent): void
+    public function setCurrentlyActiveLeaderScent(string $leaderScent, int $leaseSeconds = 3600): void
     {
+        if ($leaseSeconds <= 0) {
+            throw new \InvalidArgumentException('The leader lease must be a positive number of seconds.');
+        }
         if ($this->getCurrentlyActiveLeaderScent() !== null) {
             throw new \Exception('Already has a leader');
         }
+        $this->setLeaderLease(
+            $leaderScent,
+            (new \DateTimeImmutable())->modify(sprintf('+%d seconds', $leaseSeconds))
+        );
+    }
+
+    public function setLeaderLease(string $leaderScent, \DateTimeImmutable $expiration): void
+    {
         $this->leaderScent = $leaderScent;
-        $this->leadExpiration = (new \DateTimeImmutable())->modify('+1 hour');
+        $this->leadExpiration = $expiration;
+    }
+
+    public function clearLeaderLease(): void
+    {
+        $this->leaderScent = null;
+        $this->leadExpiration = null;
     }
 }

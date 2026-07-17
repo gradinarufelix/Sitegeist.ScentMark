@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace Sitegeist\ScentMark\Domain\Repository;
@@ -8,11 +9,14 @@ use Neos\Flow\Persistence\Repository;
 use Neos\Flow\Annotations as Flow;
 use Sitegeist\ScentMark\Domain\Model\Pack;
 
+/**
+ * @method Pack|null findOneByPackScent(string $packScent)
+ */
 #[Flow\Scope('singleton')]
 class PackRepository extends Repository
 {
     /**
-     * @var array
+     * @var array<string, string>
      */
     protected $defaultOrderings = [
         'dateTime' => QueryInterface::ORDER_DESCENDING
@@ -24,7 +28,7 @@ class PackRepository extends Repository
         $countRemoved = 0;
         $number = 0;
         foreach ($outdatedScentsQuery as $scent) {
-            $number ++;
+            $number++;
             if ($number > $keep) {
                 $this->remove($scent);
                 $countRemoved++;

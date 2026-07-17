@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+set -u
+
+STATE_DIRECTORY="${SCENTMARK_FAKE_FLOW_STATE_DIRECTORY:?}"
+printf 'started\n' >> "$STATE_DIRECTORY/worker.log"
+
+if [ "${SCENTMARK_FAKE_WORKER_EXIT:-0}" -eq 1 ]; then
+  exit 0
+fi
+
+shutdown() {
+  printf 'stopped\n' >> "$STATE_DIRECTORY/worker.log"
+  exit 0
+}
+
+trap shutdown HUP INT TERM
+
+while true; do
+  sleep 1
+done

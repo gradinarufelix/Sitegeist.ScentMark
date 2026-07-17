@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -u
+
+STATE_DIRECTORY="${SCENTMARK_FAKE_FLOW_STATE_DIRECTORY:?}"
+COMMAND="${1:-}"
+
+mkdir -p "$STATE_DIRECTORY"
+printf '%s\n' "$COMMAND" >> "$STATE_DIRECTORY/flow.log"
+
+if [ "$COMMAND" = "scentmark:bark" ]; then
+  count=0
+  if [ -f "$STATE_DIRECTORY/bark-count" ]; then
+    count="$(<"$STATE_DIRECTORY/bark-count")"
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$STATE_DIRECTORY/bark-count"
+
+  successful_calls="${SCENTMARK_FAKE_FLOW_SUCCESSFUL_BARKS:-999}"
+  if [ "$count" -gt "$successful_calls" ]; then
+    exit 1
+  fi
+fi
+
+exit 0

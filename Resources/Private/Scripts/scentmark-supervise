@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scentmark-supervise <pack-scent> <leader-scent> [options] -- <command> [arguments...]
+
+Options:
+  --lease-seconds <seconds>       Lease duration (default: 90)
+  --heartbeat-seconds <seconds>   Renewal interval (default: 20)
+  --retry-seconds <seconds>       Non-leader retry interval (default: 5)
+  --max-missed-heartbeats <count> Stop work after this many failed renewals (default: 2)
+  --flow-timeout-seconds <sec>    Timeout for a Flow lease command (default: 10)
+  --shutdown-grace-seconds <sec>  Grace before killing the child process (default: 10)
+  --release-on-exit               Release an exclusive lease during shutdown
+  --help                          Show this help
+
+Environment:
+  SCENTMARK_FLOW_COMMAND          Flow executable (default: /application/flow)
+
+Shared leases are not released by default. This allows several supervised
+services on the same replica to renew one deployment-wide leader lease safely.
+EOF
+}
+
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+if [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+if [ "$#" -lt 4 ]; then
+  usage >&2
+  exit 64
+fi
+
+PACK_SCENT="$1"
+LEADER_SCENT="$2"
+shift 2
+
+if [ -z "$PACK_SCENT" ] || [ -z "$LEADER_SCENT" ]; then
+  echo 'Pack scent and leader scent must not be empty.' >&2
+  exit 64
+fi
+
+LEASE_SECONDS="${SCENTMARK_LEASE_SECONDS:-90}"
+HEARTBEAT_SECONDS="${SCENTMARK_HEARTBEAT_SECONDS:-20}"
+RETRY_SECONDS="${SCENTMARK_RETRY_SECONDS:-5}"
+MAX_MISSED_HEARTBEATS="${SCENTMARK_MAX_MISSED_HEARTBEATS:-2}"
+FLOW_TIMEOUT_SECONDS="${SCENTMARK_FLOW_TIMEOUT_SECONDS:-10}"
+SHUTDOWN_GRACE_SECONDS="${SCENTMARK_SHUTDOWN_GRACE_SECONDS:-10}"
+FLOW_COMMAND="${SCENTMARK_FLOW_COMMAND:-/application/flow}"
+FLOW_KILL_GRACE_SECONDS=2
+SCHEDULING_SAFETY_MARGIN_SECONDS=5
+RELEASE_ON_EXIT=0
+
+require_option_value() {
+  if [ "$#" -lt 2 ]; then
+    echo "Missing value for $1." >&2
+    usage >&2
+    exit 64
+  fi
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --lease-seconds)
+      require_option_value "$@"
+      LEASE_SECONDS="$2"
+      shift 2
+      ;;
+    --heartbeat-seconds)
+      require_option_value "$@"
+      HEARTBEAT_SECONDS="$2"
+      shift 2
+      ;;
+    --retry-seconds)
+      require_option_value "$@"
+      RETRY_SECONDS="$2"
+      shift 2
+      ;;
+    --max-missed-heartbeats)
+      require_option_value "$@"
+      MAX_MISSED_HEARTBEATS="$2"
+      shift 2
+      ;;
+    --flow-timeout-seconds)
+      require_option_value "$@"
+      FLOW_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --shutdown-grace-seconds)
+      require_option_value "$@"
+      SHUTDOWN_GRACE_SECONDS="$2"
+      shift 2
+      ;;
+    --release-on-exit)
+      RELEASE_ON_EXIT=1
+      shift
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [ "$#" -eq 0 ]; then
+  echo 'A supervised command is required.' >&2
+  usage >&2
+  exit 64
+fi
+
+for value_name in \
+  LEASE_SECONDS \
+  HEARTBEAT_SECONDS \
+  RETRY_SECONDS \
+  MAX_MISSED_HEARTBEATS \
+  FLOW_TIMEOUT_SECONDS \
+  SHUTDOWN_GRACE_SECONDS
+do
+  value="${!value_name}"
+  if ! is_positive_integer "$value"; then
+    echo "$value_name must be a positive integer; got: $value" >&2
+    exit 64
+  fi
+done
+
+FAILURE_WINDOW_SECONDS=$((
+  (
+    (HEARTBEAT_SECONDS + FLOW_TIMEOUT_SECONDS + FLOW_KILL_GRACE_SECONDS)
+    * MAX_MISSED_HEARTBEATS
+  ) + SHUTDOWN_GRACE_SECONDS + SCHEDULING_SAFETY_MARGIN_SECONDS
+))
+if [ "$FAILURE_WINDOW_SECONDS" -ge "$LEASE_SECONDS" ]; then
+  echo "The worst-case shutdown window (${FAILURE_WINDOW_SECONDS}s) must be shorter than the lease." >&2
+  exit 64
+fi
+
+CHILD_PID=''
+OWNS_LEASE=0
+FLOW_PID=''
+WATCHDOG_PID=''
+
+stop_flow_command() {
+  if [ -n "$WATCHDOG_PID" ]; then
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+    WATCHDOG_PID=''
+  fi
+  if [ -n "$FLOW_PID" ] && kill -0 "$FLOW_PID" 2>/dev/null; then
+    kill -TERM "$FLOW_PID" 2>/dev/null || true
+    sleep "$FLOW_KILL_GRACE_SECONDS"
+    kill -KILL "$FLOW_PID" 2>/dev/null || true
+    wait "$FLOW_PID" 2>/dev/null || true
+  fi
+  FLOW_PID=''
+}
+
+run_flow_command() {
+  local flow_exit_code
+
+  "$FLOW_COMMAND" "$@" &
+  FLOW_PID="$!"
+
+  (
+    sleep "$FLOW_TIMEOUT_SECONDS"
+    kill -TERM "$FLOW_PID" 2>/dev/null || exit 0
+    sleep "$FLOW_KILL_GRACE_SECONDS"
+    kill -KILL "$FLOW_PID" 2>/dev/null || true
+  ) &
+  WATCHDOG_PID="$!"
+
+  wait "$FLOW_PID"
+  flow_exit_code="$?"
+  FLOW_PID=''
+  kill "$WATCHDOG_PID" 2>/dev/null || true
+  wait "$WATCHDOG_PID" 2>/dev/null || true
+  WATCHDOG_PID=''
+  return "$flow_exit_code"
+}
+
+release_lease() {
+  if [ "$OWNS_LEASE" -eq 1 ] && [ "$RELEASE_ON_EXIT" -eq 1 ]; then
+    run_flow_command scentmark:release "$PACK_SCENT" "$LEADER_SCENT" >/dev/null 2>&1 || true
+    OWNS_LEASE=0
+  fi
+}
+
+stop_child() {
+  local remaining
+
+  if [ -z "$CHILD_PID" ] || ! kill -0 "$CHILD_PID" 2>/dev/null; then
+    CHILD_PID=''
+    return
+  fi
+
+  kill -TERM "$CHILD_PID" 2>/dev/null || true
+  remaining="$SHUTDOWN_GRACE_SECONDS"
+  while kill -0 "$CHILD_PID" 2>/dev/null && [ "$remaining" -gt 0 ]; do
+    sleep 1
+    remaining=$((remaining - 1))
+  done
+  if kill -0 "$CHILD_PID" 2>/dev/null; then
+    kill -KILL "$CHILD_PID" 2>/dev/null || true
+  fi
+  wait "$CHILD_PID" 2>/dev/null || true
+  CHILD_PID=''
+}
+
+shutdown() {
+  local requested_exit_code="$1"
+
+  trap - HUP INT TERM
+  stop_flow_command
+  stop_child
+  release_lease
+  exit "$requested_exit_code"
+}
+
+trap 'shutdown 129' HUP
+trap 'shutdown 130' INT
+trap 'shutdown 143' TERM
+
+while true; do
+  if ! run_flow_command scentmark:bark "$PACK_SCENT" "$LEADER_SCENT" \
+    --lease-seconds "$LEASE_SECONDS" >/dev/null 2>&1; then
+    sleep "$RETRY_SECONDS"
+    continue
+  fi
+
+  OWNS_LEASE=1
+  echo "Acquired Scentmark lease '$PACK_SCENT' as '$LEADER_SCENT'."
+  missed_heartbeats=0
+  next_heartbeat_at=$((SECONDS + HEARTBEAT_SECONDS))
+
+  while [ "$OWNS_LEASE" -eq 1 ]; do
+    if [ "$SECONDS" -ge "$next_heartbeat_at" ]; then
+      if run_flow_command scentmark:bark "$PACK_SCENT" "$LEADER_SCENT" \
+        --lease-seconds "$LEASE_SECONDS" >/dev/null 2>&1; then
+        missed_heartbeats=0
+      else
+        missed_heartbeats=$((missed_heartbeats + 1))
+        echo "Missed Scentmark heartbeat $missed_heartbeats/$MAX_MISSED_HEARTBEATS for '$PACK_SCENT'." >&2
+        if [ "$missed_heartbeats" -ge "$MAX_MISSED_HEARTBEATS" ]; then
+          echo "Stopping supervised command before lease '$PACK_SCENT' can expire." >&2
+          stop_child
+          OWNS_LEASE=0
+          break
+        fi
+      fi
+      next_heartbeat_at=$((SECONDS + HEARTBEAT_SECONDS))
+    fi
+
+    if [ -z "$CHILD_PID" ]; then
+      "$@" &
+      CHILD_PID="$!"
+    fi
+
+    while kill -0 "$CHILD_PID" 2>/dev/null && [ "$SECONDS" -lt "$next_heartbeat_at" ]; do
+      sleep 1
+    done
+
+    if ! kill -0 "$CHILD_PID" 2>/dev/null; then
+      wait "$CHILD_PID"
+      child_exit_code="$?"
+      CHILD_PID=''
+      echo "Supervised command exited with status $child_exit_code; restarting in ${RETRY_SECONDS}s."
+      sleep "$RETRY_SECONDS"
+    fi
+  done
+
+  # A shared lease is allowed to expire instead of being released here. Other
+  # services with the same leader scent may still be doing useful work.
+  sleep "$RETRY_SECONDS"
+done

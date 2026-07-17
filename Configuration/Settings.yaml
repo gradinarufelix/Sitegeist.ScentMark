@@ -1,0 +1,8 @@
+Sitegeist:
+  ScentMark:
+    leaderLease:
+      # Keep the historic one-hour lease unless a project explicitly opts in
+      # to faster failover.
+      defaultSeconds: 3600
+      minimumSeconds: 10
+      maximumSeconds: 86400

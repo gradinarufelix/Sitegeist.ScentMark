@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit
+    bootstrap="Tests/Bootstrap.php"
+    cacheResult="false"
+    colors="true"
+    failOnWarning="true"
+>
+    <testsuites>
+        <testsuite name="Sitegeist.ScentMark unit tests">
+            <directory>Tests/Unit</directory>
+        </testsuite>
+    </testsuites>
+</phpunit>
