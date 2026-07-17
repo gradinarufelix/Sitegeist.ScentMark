@@ -51,6 +51,7 @@ final class LeaderLeaseService
                 : LeaderLeaseResult::ACQUIRED;
             $expiration = $now->modify(sprintf('+%d seconds', $leaseSeconds));
             $pack->setLeaderLease($leaderScent, $expiration);
+            $entityManager->persist($pack);
 
             return new LeaderLeaseResult($outcome, $leaderScent, $expiration);
         });
@@ -79,6 +80,7 @@ final class LeaderLeaseService
             }
 
             $pack->clearLeaderLease();
+            $entityManager->persist($pack);
             return new LeaderLeaseResult(LeaderLeaseResult::RELEASED);
         });
 

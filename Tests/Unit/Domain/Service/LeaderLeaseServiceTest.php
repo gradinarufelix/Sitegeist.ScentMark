@@ -35,7 +35,7 @@ final class LeaderLeaseServiceTest extends TestCase
         $pack = new Pack();
         $pack->setLeaderLease('replica-a', new \DateTimeImmutable('2026-07-17 12:05:00'));
         $query = $this->createPackQuery($pack, true);
-        $entityManager = $this->createEntityManager($query, '2026-07-17 12:00:00');
+        $entityManager = $this->createEntityManager($query, '2026-07-17 12:00:00', true, false);
 
         $result = $this->createService($entityManager)->acquireOrRenew('release-123', 'replica-b', 90);
 
@@ -112,7 +112,8 @@ final class LeaderLeaseServiceTest extends TestCase
     private function createEntityManager(
         Query $query,
         ?string $databaseNow,
-        bool $expectTransaction = true
+        bool $expectTransaction = true,
+        bool $expectPersist = true
     ): EntityManagerInterface {
         $entityManager = $this->createMock(EntityManagerInterface::class);
         if ($expectTransaction) {
@@ -127,6 +128,9 @@ final class LeaderLeaseServiceTest extends TestCase
         $entityManager->expects(self::once())
             ->method('createQuery')
             ->willReturn($query);
+        $entityManager->expects($expectTransaction && $expectPersist ? self::once() : self::never())
+            ->method('persist')
+            ->with(self::isInstanceOf(Pack::class));
 
         if ($databaseNow !== null) {
             $platform = $this->createMock(AbstractPlatform::class);
